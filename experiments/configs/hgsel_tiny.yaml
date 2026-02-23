@@ -1,0 +1,38 @@
+"""
+Minimal HGSEL model (for quick testing).
+
+This is the smallest HGSEL configuration for Phase 2 validation.
+"""
+
+# Model
+vocab_size: 256
+d_model: 128
+d_ff: 512
+n_layers: 2
+n_heads: 2
+
+# Training
+batch_size: 8
+val_batch_size: 16
+num_epochs: 2
+learning_rate: 0.001
+weight_decay: 0.0001
+warmup_steps: 100
+
+# Load balancing (HGSEL)
+aux_loss_weight: 0.05
+aux_loss_schedule: constant
+salt_tuning_interval: 100
+
+# Data
+seq_len: 64
+
+# Logging
+log_interval: 5
+val_interval: 50
+save_interval: 100
+use_wandb: false
+
+# Other
+device: cuda
+checkpoint_dir: ./checkpoints/hgsel_tiny
