@@ -4,24 +4,28 @@
 
 **Duration:** Days 6-7 (estimated)
 
-**Objective:** Build multi-GPU distributed training infrastructure for HGSEL, enabling expert sharding and synchronized gradient updates across nodes.
+**Objective:** Prove HGSEL multi-GPU scaling with a systems-first workflow: instrumented GPU baseline, DDP parity, expert-parallel communication microbenchmarking, then expert sharding integration.
+
+> Note: This document currently functions as a Phase 4 implementation tracker/draft. The authoritative execution order and success gates are defined in `PHASE4_PLANNING.md` (updated to require a communication microbenchmark before full expert-parallel integration claims).
 
 ---
 
 ## What Phase 4 Achieves
 
-Phase 4 transforms HGSEL from single-GPU to multi-GPU capable, implementing:
-- **All-to-all token exchange** for expert-parallel dispatch
-- **All-reduce gradient synchronization** for distributed training
-- **Expert sharding** across GPU ranks
-- **Distributed training wrapper** for easy multi-GPU training
-- **End-to-end validation** with synchronization tests
+Phase 4 transforms HGSEL from single-GPU experimentation into a multi-GPU systems validation effort. The primary deliverable is not just a distributed trainer, but credible evidence that expert-parallel token exchange stays within a viable communication budget.
+
+**Execution order (required):**
+1. Instrumented GPU baseline (control condition)
+2. DDP-only parity validation (no expert sharding)
+3. Expert-parallel all-to-all communication microbenchmark
+4. Expert sharding + all-to-all integration
+5. Full training + scaling measurements (1/2/4 GPU plot)
 
 ### Key Components
 
 #### 1. Token Exchange: `hgsel/distributed/token_exchange.py`
 
-**Status:** ○ Not Yet Implemented
+**Status:** ✓ Implemented (single-rank tested; multi-rank runtime validation pending)
 
 Implements actual all-to-all communication for routing tokens to remote experts:
 
@@ -38,14 +42,15 @@ class TokenExchange:
         """
 ```
 
-**Implementation Plan:**
+**Current State:**
 - Use `torch.distributed.all_to_all_single()` for payload exchange
 - Handle variable-length token batches (requires padding/unpadding)
 - Support fallback to single-GPU mode (no-op when rank=0, world_size=1)
+- Captures per-exchange timing + payload statistics for debugging/benchmarking
 
 #### 2. All-Reduce for Loss & Metrics: `hgsel/distributed/dist_utils.py`
 
-**Status:** ○ Not Yet Implemented
+**Status:** ✓ Implemented + unit tested (single-rank/no-PG mode)
 
 Synchronization helpers for distributed training:
 
@@ -68,9 +73,9 @@ def barrier() -> None:
 
 #### 3. Distributed Trainer: `hgsel/training/distributed_trainer.py`
 
-**Status:** ○ Not Yet Implemented
+**Status:** ✓ DDP-first parity path implemented (single-rank smoke + tests passing)
 
-Wrapper around base Trainer for multi-GPU orchestration:
+Wrapper around base Trainer for multi-GPU orchestration (Phase 4 DDP-first path):
 
 ```python
 class DistributedTrainer(Trainer):
@@ -100,7 +105,7 @@ Deterministic expert partitioning across ranks is already implemented.
 
 #### 5. Distributed Dispatch Pipeline: `hgsel/distributed/dispatch_pipeline.py`
 
-**Status:** ○ Not Yet Implemented
+**Status:** ✓ Partial / evolving (planning + scaffolding present; full expert-parallel integration still pending Phase 4 gate results)
 
 Complete dispatch flow: local experts + remote all-to-all:
 
@@ -126,7 +131,7 @@ class DistributedDispatchPipeline:
 
 **File:** `hgsel/distributed/dist_utils.py`
 
-Core distributed utilities:
+Core distributed utilities (implemented):
 - Rank detection (single-GPU fallback)
 - World size, backend detection
 - All-reduce operations (mean, sum)
@@ -136,7 +141,7 @@ Core distributed utilities:
 
 **File:** `hgsel/distributed/token_exchange.py`
 
-All-to-all communication:
+All-to-all communication (implemented, pending real multi-rank validation):
 - Payload packing per destination rank
 - `torch.distributed.all_to_all_single()` call
 - Variable-length handling with padding
@@ -146,12 +151,32 @@ All-to-all communication:
 
 **File:** `hgsel/training/distributed_trainer.py`
 
-Multi-GPU training orchestration:
+Multi-GPU training orchestration (DDP-first parity path implemented):
 - Extend base Trainer
 - Setup/cleanup torch.distributed
 - Wrap loss computation with all-reduce
 - Gradient averaging across ranks
 - Checkpoint only on rank 0
+- Save/load RNG state for resume validation
+
+### Step 3b: Create Distributed Data Helpers (DDP Parity)
+
+**File:** `hgsel/training/dist_data.py`
+
+DistributedSampler-based synthetic data loaders:
+- Deterministic per-rank dummy LM dataset
+- Global batch size accounting (`per_rank_batch_size * world_size`)
+- `set_epoch()` helper for epoch-seeded shuffling
+
+### Step 3c: Build Instrumented GPU Baseline Harness
+
+**File:** `experiments/train_gpu_baseline.py`
+
+Single-device control-condition benchmark:
+- Tokens/sec
+- Forward/backward/optimizer timings
+- Peak memory
+- HGSEL expert utilization histograms and entropy
 
 ### Step 4: Implement DispatchPipeline
 
@@ -178,10 +203,22 @@ Test coverage:
 **File:** `experiments/train_distributed_300m.py`
 
 Distributed training entry point:
-- Torchrun / torch.distributed.launch integration
+- Torchrun integration (preferred)
 - Master node training loop
 - Periodic validation on rank 0
 - Aggregated metrics logging
+
+### Step 7: Build Communication Microbenchmark (Gate)
+
+**File:** `experiments/benchmark_token_exchange_micro.py`
+
+Synthetic expert-parallel benchmark:
+- Generate synthetic token payloads
+- Simulate routing distributions (balanced, moderate skew, worst-case skew)
+- Measure all-to-all exchange time vs local expert compute time
+- Report communication share of forward and go/warn/stop decision
+
+**Gate:** If all-to-all communication is already too large relative to local expert compute (especially in representative batch regimes), optimize/redesign before full trainer integration claims.
 
 ---
 
@@ -189,15 +226,21 @@ Distributed training entry point:
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `hgsel/distributed/dist_utils.py` | All-reduce, rank utilities | ○ |
-| `hgsel/distributed/token_exchange.py` | All-to-all communication | ○ |
-| `hgsel/training/distributed_trainer.py` | Multi-GPU trainer wrapper | ○ |
-| `hgsel/distributed/dispatch_pipeline.py` | Complete distribute dispatch | ○ |
-| `experiments/train_distributed_300m.py` | Distributed training script | ○ |
-| `tests/test_dist_utils.py` | Utilities tests | ○ |
-| `tests/test_token_exchange.py` | Exchange simulation tests | ○ |
-| `tests/test_dispatch_api.py` | API integration tests | ○ |
-| `tests/test_dist_smoke.py` | End-to-end smoke tests | ○ |
+| `hgsel/distributed/dist_utils.py` | All-reduce, rank utilities | ✓ |
+| `hgsel/distributed/token_exchange.py` | All-to-all communication | ✓ (single-rank tested) |
+| `hgsel/training/distributed_trainer.py` | DDP-first trainer wrapper | ✓ (parity path) |
+| `hgsel/training/dist_data.py` | DistributedSampler data helpers | ✓ |
+| `hgsel/distributed/dispatch_pipeline.py` | Complete distributed dispatch | ○ (expert-parallel integration pending) |
+| `experiments/train_gpu_baseline.py` | Instrumented GPU baseline control | ✓ |
+| `experiments/train_distributed_300m.py` | DDP parity / distributed training script | ✓ (single-rank smoke tested) |
+| `experiments/benchmark_token_exchange_micro.py` | Communication microbenchmark gate | ✓ (single-rank smoke tested) |
+| `experiments/phase4_gate_report.py` | Aggregate baseline/parity/microbenchmark JSONs into go/warn/stop report | ✓ |
+| `tests/test_dist_utils.py` | Utilities tests | ✓ |
+| `tests/test_dist_data.py` | DistributedSampler helper tests | ✓ |
+| `tests/test_distributed_trainer_single.py` | Single-rank trainer + checkpoint/RNG roundtrip | ✓ |
+| `tests/test_token_exchange.py` | Exchange simulation + padding/stats tests | ✓ |
+| `tests/test_dispatch_api.py` | API integration tests | ○ (existing coverage in `test_dist_smoke.py` / `test_distributed_integration.py`) |
+| `tests/test_dist_smoke.py` | Distributed component smoke tests | ✓ (single-process simulated) |
 | `PHASE4_COMPLETION.md` | This document | ✓ |
 
 ---
@@ -274,18 +317,33 @@ python experiments/train_distributed_300m.py \
 pytest tests/test_dist_smoke.py -v
 ```
 
+### Aggregate Phase 4 Gates (Recommended After Linux/NCCL Runs)
+```bash
+python experiments/phase4_gate_report.py \
+    --baseline-json results/gpu_baseline/train_gpu_baseline.json \
+    --parity-json results/phase4/ddp_parity.json \
+    --microbench-json results/token_exchange_micro/benchmark_token_exchange_micro.json \
+    --strict-phase4 \
+    --output results/phase4/phase4_gate_report.json
+```
+
+Notes:
+- `--strict-phase4` promotes non-representative runs (CPU, non-NCCL, `world_size=1`, smoke baseline settings) from `WARN` to `STOP`.
+- Optional parity reference comparison is supported via `--parity-reference-json` or manual `--parity-reference-final-*` overrides.
+
 ---
 
 ## Success Criteria
 
 ✓ **Phase 4 Complete When:**
-1. All-to-all token exchange works in single-GPU mode (fallback correct)
-2. All-reduce for loss, perplexity, entropy across simulated ranks
-3. DistributedTrainer sets up/cleans up torch.distributed correctly
-4. DispatchPipeline routes local + remote experts and combines outputs
-5. Distributed training script runs on 1+ GPUs with lower per-rank loss
-6. Tests pass: unit + integration + smoke tests
-7. Documentation complete with usage examples
+1. Single-GPU GPU baseline is recorded with instrumentation (tokens/sec, forward/backward time, peak memory, expert utilization histogram)
+2. DDP-only multi-GPU path reaches convergence parity with Phase 3 / single-GPU baseline
+3. Expert-parallel communication microbenchmark is completed and documented (all-to-all vs local expert compute)
+4. Representative expert-parallel communication overhead is within budget (target `<20%` forward; otherwise optimize/redesign before claiming scale)
+5. Expert-sharded training path runs and preserves convergence behavior
+6. Scaling plot (1/2/4 GPU) reports speedup and efficiency with batch-size context
+7. Distributed tests pass, including checkpoint save/restore (model + optimizer + RNG state)
+8. Documentation complete with usage examples and communication breakdown
 
 ---
 
@@ -320,18 +378,21 @@ pytest tests/test_dist_smoke.py -v
 
 ## Checklist
 
-- [ ] dist_utils.py implemented and tested
-- [ ] TokenExchange with all_to_all_single() works
-- [ ] DistributedTrainer extends Trainer, handles all-reduce
-- [ ] DispatchPipeline routes local + remote correctly
-- [ ] test_dist_utils.py passes
-- [ ] test_token_exchange.py passes
-- [ ] test_dispatch_api.py passes
-- [ ] test_dist_smoke.py passes (2+ simulated ranks)
-- [ ] train_distributed_300m.py runs on multi-GPU
-- [ ] Documentation updated with Phase 4 examples
+- [x] dist_utils.py implemented and tested (single-rank / no-PG mode)
+- [x] TokenExchange with all_to_all_single() implemented (single-rank fallback tested)
+- [x] DistributedTrainer DDP-first parity path implemented
+- [ ] DispatchPipeline routes local + remote correctly in real distributed expert-parallel mode
+- [x] test_dist_utils.py passes
+- [x] test_token_exchange.py passes (includes padding/stats behavior)
+- [x] test_dist_data.py passes
+- [x] test_distributed_trainer_single.py passes (includes checkpoint + RNG roundtrip)
+- [x] test_dist_smoke.py passes (single-process/simulated distributed components)
+- [ ] train_distributed_300m.py validated on real multi-GPU (`torchrun`, Linux/NCCL)
+- [ ] benchmark_token_exchange_micro.py validated on real multi-GPU (`torchrun`, Linux/NCCL)
+- [ ] phase4_gate_report.py run on real baseline/parity/microbenchmark JSON outputs (`--strict-phase4`)
+- [ ] Documentation updated with Phase 4 multi-GPU results + scaling plot
 
 ---
 
-**Next Phase:** Phase 5 (Benchmarking & Optimizations) — Measure throughput, memory, latency on distributed setup; overlap comms with compute.
+**Next Phase:** Phase 5 (Benchmarking & Optimizations) builds on a validated Phase 4 proof-of-scale. Phase 5 profiling infrastructure is useful earlier, but does not replace Phase 4 communication-budget validation.
 

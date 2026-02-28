@@ -36,6 +36,7 @@ class TrainingConfig:
         self.weight_decay = kwargs.get("weight_decay", 1e-4)
         self.warmup_steps = kwargs.get("warmup_steps", 1000)
         self.gradient_accumulation_steps = kwargs.get("gradient_accumulation_steps", 1)
+        self.clip_grad_norm = kwargs.get("clip_grad_norm", None)
         
         # Load balancing (Phase 1-2)
         self.aux_loss_weight = kwargs.get("aux_loss_weight", 0.05)

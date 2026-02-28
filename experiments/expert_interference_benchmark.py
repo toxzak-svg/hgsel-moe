@@ -23,6 +23,8 @@ Hypothesis to FALSIFY:
   - Catastrophic interference (then you need strict partitioning).
 """
 
+import argparse
+import json
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,6 +39,45 @@ from collections import defaultdict
 
 from hgsel.layer import HGSELLayer
 from experiments.baselines.dense_transformer import TransformerModel
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Expert interference benchmark (concurrent workloads)")
+    parser.add_argument("--num-batches", type=int, default=20, help="Number of batches per workload")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--seq-len", type=int, default=128, help="Sequence length")
+    parser.add_argument("--n-experts", type=int, default=64, help="Number of experts")
+    parser.add_argument("--k-active", type=int, default=2, help="Active experts per token")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="Execution device (auto prefers CUDA)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="results/expert_interference.png",
+        help="Output plot path",
+    )
+    parser.add_argument(
+        "--json-output",
+        type=str,
+        default="",
+        help="Optional JSON summary output path",
+    )
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Skip plot generation (useful for CI/smoke runs)",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run a short smoke configuration",
+    )
+    return parser.parse_args()
 
 
 class WorkloadGenerator:
@@ -251,22 +292,89 @@ def compute_interference_metrics(
     return metrics
 
 
+def classify_interference(max_interf_abs_pct: float) -> Dict[str, str]:
+    if max_interf_abs_pct < 5.0:
+        return {
+            "level": "negligible",
+            "verdict": "OK",
+            "message": "Interference is NEGLIGIBLE",
+            "implication": "Multi-tenancy is safe, no isolation needed",
+        }
+    if max_interf_abs_pct < 20.0:
+        return {
+            "level": "moderate",
+            "verdict": "WARN",
+            "message": "Interference is MODERATE",
+            "implication": "Consider soft partitioning (priority scheduling)",
+        }
+    return {
+        "level": "severe",
+        "verdict": "FAIL",
+        "message": "Interference is SEVERE",
+        "implication": "Need strict resource partitioning or isolation",
+    }
+
+
+def metrics_to_builtin(metrics: Dict) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for workload, values in metrics.items():
+        out[str(workload)] = {}
+        for k, v in values.items():
+            out[str(workload)][str(k)] = float(v)
+    return out
+
+
 def main():
     """Run interference benchmark with concurrent workloads."""
+    args = parse_args()
+
+    if args.num_batches <= 0:
+        raise ValueError("--num-batches must be > 0")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+    if args.seq_len <= 0:
+        raise ValueError("--seq-len must be > 0")
+    if args.n_experts <= 0:
+        raise ValueError("--n-experts must be > 0")
+    if args.k_active <= 0:
+        raise ValueError("--k-active must be > 0")
+
+    if args.smoke:
+        if args.num_batches == 20:
+            args.num_batches = 4
+        if args.batch_size == 32:
+            args.batch_size = 4
+        if args.seq_len == 128:
+            args.seq_len = 32
+        if args.n_experts == 64:
+            args.n_experts = 32
+
     print("=" * 70)
     print("Expert Interference Benchmarks")
     print("(Coding + Math concurrent workloads)")
     print("=" * 70)
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\nDevice: {device}\n")
+
+    if args.device == "cpu":
+        device = "cpu"
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested but CUDA is unavailable")
+        device = "cuda"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(
+        f"\nDevice: {device}\n"
+        f"Run config: num_batches={args.num_batches}, batch_size={args.batch_size}, seq_len={args.seq_len}, "
+        f"n_experts={args.n_experts}, k_active={args.k_active}\n"
+    )
     
     # Configuration
-    n_experts = 64
-    k_active = 2
-    batch_size = 32
-    seq_len = 128
-    num_batches = 20
+    n_experts = args.n_experts
+    k_active = args.k_active
+    batch_size = args.batch_size
+    seq_len = args.seq_len
+    num_batches = args.num_batches
     
     # Create two identical models
     print(f"Creating models...")
@@ -311,8 +419,8 @@ def main():
         'workload_b': np.mean(baseline['workload_b']),
     }
     
-    print(f"\n  Workload A: {baseline_stats['workload_a']:.2f} µs/token")
-    print(f"  Workload B: {baseline_stats['workload_b']:.2f} µs/token")
+    print(f"\n  Workload A: {baseline_stats['workload_a']:.2f} us/token")
+    print(f"  Workload B: {baseline_stats['workload_b']:.2f} us/token")
     
     # Interleaved: alternating
     print(f"\n{'='*70}")
@@ -329,11 +437,11 @@ def main():
     metrics_alt = compute_interference_metrics(baseline, interleaved_alt)
     
     print(f"\n  Workload A:")
-    print(f"    Latency: {metrics_alt['workload_a']['interleaved_mean_us']:.2f} µs/token")
+    print(f"    Latency: {metrics_alt['workload_a']['interleaved_mean_us']:.2f} us/token")
     print(f"    Interference: {metrics_alt['workload_a']['interference_pct']:+.1f}%")
     
     print(f"\n  Workload B:")
-    print(f"    Latency: {metrics_alt['workload_b']['interleaved_mean_us']:.2f} µs/token")
+    print(f"    Latency: {metrics_alt['workload_b']['interleaved_mean_us']:.2f} us/token")
     print(f"    Interference: {metrics_alt['workload_b']['interference_pct']:+.1f}%")
     
     # Interleaved: random
@@ -351,40 +459,12 @@ def main():
     metrics_rand = compute_interference_metrics(baseline, interleaved_rand)
     
     print(f"\n  Workload A:")
-    print(f"    Latency: {metrics_rand['workload_a']['interleaved_mean_us']:.2f} µs/token")
+    print(f"    Latency: {metrics_rand['workload_a']['interleaved_mean_us']:.2f} us/token")
     print(f"    Interference: {metrics_rand['workload_a']['interference_pct']:+.1f}%")
     
     print(f"\n  Workload B:")
-    print(f"    Latency: {metrics_rand['workload_b']['interleaved_mean_us']:.2f} µs/token")
+    print(f"    Latency: {metrics_rand['workload_b']['interleaved_mean_us']:.2f} us/token")
     print(f"    Interference: {metrics_rand['workload_b']['interference_pct']:+.1f}%")
-    
-    # Plotting
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Latency by scenario
-    scenarios = ['Isolated', 'Alternating', 'Random']
-    workload_a_lats = [
-        baseline_stats['workload_a'],
-        metrics_alt['workload_a']['interleaved_mean_us'],
-        metrics_rand['workload_a']['interleaved_mean_us'],
-    ]
-    workload_b_lats = [
-        baseline_stats['workload_b'],
-        metrics_alt['workload_b']['interleaved_mean_us'],
-        metrics_rand['workload_b']['interleaved_mean_us'],
-    ]
-    
-    x = np.arange(len(scenarios))
-    width = 0.35
-    
-    axes[0].bar(x - width/2, workload_a_lats, width, label='Workload A (Coding)', color='#2E86AB')
-    axes[0].bar(x + width/2, workload_b_lats, width, label='Workload B (Math)', color='#A23B72')
-    axes[0].set_ylabel('Latency (µs/token)', fontsize=11)
-    axes[0].set_title('Latency by Scheduling Scenario', fontsize=12, fontweight='bold')
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(scenarios)
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3, axis='y')
     
     # Interference % by scenario
     interf_a_alt = metrics_alt['workload_a']['interference_pct']
@@ -400,21 +480,59 @@ def main():
     scenarios_no_base = ['Alternating', 'Random']
     interf_a = [interf_a_alt, interf_a_rand]
     interf_b = [interf_b_alt, interf_b_rand]
-    
-    x2 = np.arange(len(scenarios_no_base))
-    axes[1].bar(x2 - width/2, interf_a, width, label='Workload A', color='#2E86AB')
-    axes[1].bar(x2 + width/2, interf_b, width, label='Workload B', color='#A23B72')
-    axes[1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
-    axes[1].set_ylabel('Interference (%)', fontsize=11)
-    axes[1].set_title('Latency Blowup from Interference', fontsize=12, fontweight='bold')
-    axes[1].set_xticks(x2)
-    axes[1].set_xticklabels(scenarios_no_base)
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3, axis='y')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(os.path.dirname(__file__), '../results/expert_interference.png'), dpi=100)
-    print(f"\n  Saved: results/expert_interference.png")
+
+    rel_output = None
+    if args.no_plot:
+        print("\n  Plot generation skipped (--no-plot)")
+    else:
+        # Plotting
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Latency by scenario
+        scenarios = ['Isolated', 'Alternating', 'Random']
+        workload_a_lats = [
+            baseline_stats['workload_a'],
+            metrics_alt['workload_a']['interleaved_mean_us'],
+            metrics_rand['workload_a']['interleaved_mean_us'],
+        ]
+        workload_b_lats = [
+            baseline_stats['workload_b'],
+            metrics_alt['workload_b']['interleaved_mean_us'],
+            metrics_rand['workload_b']['interleaved_mean_us'],
+        ]
+
+        x = np.arange(len(scenarios))
+        width = 0.35
+
+        axes[0].bar(x - width/2, workload_a_lats, width, label='Workload A (Coding)', color='#2E86AB')
+        axes[0].bar(x + width/2, workload_b_lats, width, label='Workload B (Math)', color='#A23B72')
+        axes[0].set_ylabel('Latency (us/token)', fontsize=11)
+        axes[0].set_title('Latency by Scheduling Scenario', fontsize=12, fontweight='bold')
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(scenarios)
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3, axis='y')
+
+        x2 = np.arange(len(scenarios_no_base))
+        axes[1].bar(x2 - width/2, interf_a, width, label='Workload A', color='#2E86AB')
+        axes[1].bar(x2 + width/2, interf_b, width, label='Workload B', color='#A23B72')
+        axes[1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        axes[1].set_ylabel('Interference (%)', fontsize=11)
+        axes[1].set_title('Latency Blowup from Interference', fontsize=12, fontweight='bold')
+        axes[1].set_xticks(x2)
+        axes[1].set_xticklabels(scenarios_no_base)
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        output_path = args.output
+        if not os.path.isabs(output_path):
+            output_path = os.path.join(os.path.dirname(__file__), "..", output_path)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        plt.savefig(output_path, dpi=100)
+        plt.close(fig)
+        rel_output = os.path.relpath(output_path, os.path.join(os.path.dirname(__file__), ".."))
+        print(f"\n  Saved: {rel_output}")
     
     # Summary
     print(f"\n{'='*70}")
@@ -428,19 +546,58 @@ def main():
     
     print(f"\nMax interference magnitude observed: {max_interf:.1f}%")
     
-    if max_interf < 5:
-        print("✓ CONCLUSION: Interference is NEGLIGIBLE")
-        print("✓ Implication: Multi-tenancy is safe, no isolation needed")
-    elif max_interf < 20:
-        print("~ CONCLUSION: Interference is MODERATE")
-        print("~ Implication: Consider soft partitioning (priority scheduling)")
-    else:
-        print("✗ CONCLUSION: Interference is SEVERE")
-        print("✗ Implication: Need strict resource partitioning or isolation")
+    classification = classify_interference(float(max_interf))
+    print(f"[{classification['verdict']}] CONCLUSION: {classification['message']}")
+    print(f"[{classification['verdict']}] Implication: {classification['implication']}")
     
     print(f"\nDetails:")
     print(f"  Alternating: A={interf_a_alt:+.1f}% (|{interf_a_alt_abs:.1f}|), B={interf_b_alt:+.1f}% (|{interf_b_alt_abs:.1f}|)")
     print(f"  Random:      A={interf_a_rand:+.1f}% (|{interf_a_rand_abs:.1f}|), B={interf_b_rand:+.1f}% (|{interf_b_rand_abs:.1f}|)")
+
+    if args.json_output:
+        json_output_path = args.json_output
+        if not os.path.isabs(json_output_path):
+            json_output_path = os.path.join(os.path.dirname(__file__), "..", json_output_path)
+        os.makedirs(os.path.dirname(json_output_path), exist_ok=True)
+
+        payload = {
+            "metadata": {
+                "script": "experiments/expert_interference_benchmark.py",
+                "device": device,
+                "smoke": bool(args.smoke),
+                "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "plot_generated": not bool(args.no_plot),
+                "plot_output": rel_output,
+            },
+            "run_config": {
+                "num_batches": int(num_batches),
+                "batch_size": int(batch_size),
+                "seq_len": int(seq_len),
+                "n_experts": int(n_experts),
+                "k_active": int(k_active),
+            },
+            "scenarios": {
+                "isolated_baseline_mean_us": {
+                    "workload_a": float(baseline_stats["workload_a"]),
+                    "workload_b": float(baseline_stats["workload_b"]),
+                },
+                "alternating": metrics_to_builtin(metrics_alt),
+                "random": metrics_to_builtin(metrics_rand),
+            },
+            "summary": {
+                "max_interference_abs_pct": float(max_interf),
+                "level": str(classification["level"]),
+                "verdict": str(classification["verdict"]),
+                "message": str(classification["message"]),
+                "implication": str(classification["implication"]),
+            },
+        }
+
+        with open(json_output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        rel_json_output = os.path.relpath(json_output_path, os.path.join(os.path.dirname(__file__), ".."))
+        print(f"  Wrote JSON summary: {rel_json_output}")
 
 
 if __name__ == "__main__":

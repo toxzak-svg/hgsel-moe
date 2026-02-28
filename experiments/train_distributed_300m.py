@@ -13,6 +13,7 @@ Usage with single GPU (no distributed):
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -24,8 +25,9 @@ current_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(current_dir))
 
 from hgsel.distributed import dist_utils
+from hgsel.layer import HGSELLayer
 from hgsel.training.distributed_trainer import DistributedTrainer
-from hgsel.training.data import DummyDataLoader, LanguageModelDataset
+from hgsel.training.dist_data import create_distributed_dummy_loaders
 from hgsel.training.trainer import TrainingConfig
 from experiments.baselines.dense_transformer import TransformerModel
 
@@ -59,84 +61,99 @@ def parse_args():
     parser.add_argument("--clip-grad-norm", type=float, default=1.0, help="Gradient clipping norm")
     
     # Distributed configuration
-    parser.add_argument("--backend", type=str, default="nccl", help="Distributed backend")
+    parser.add_argument("--backend", type=str, default="auto", help="Distributed backend (auto|nccl|gloo)")
     parser.add_argument("--master-addr", type=str, default="localhost", help="Master address")
     parser.add_argument("--master-port", type=str, default="12355", help="Master port")
+    parser.add_argument("--seed", type=int, default=1234, help="Random seed")
     
     # Logging
     parser.add_argument("--log-interval", type=int, default=10, help="Logging interval")
     parser.add_argument("--val-interval", type=int, default=1, help="Validation interval")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/phase4_distributed",
                        help="Checkpoint directory")
+    parser.add_argument("--results-json", type=str, default="",
+                       help="Optional path to write training results JSON (rank 0 only)")
     
     return parser.parse_args()
 
 
 def create_model(args):
     """Create model based on arguments."""
-    # For now, always use dense baseline
-    # TODO: Support HGSEL layers in distributed setup
+    mlp_class = HGSELLayer if args.use_hgsel else None
+    mlp_kwargs = None
+    if args.use_hgsel:
+        mlp_kwargs = {"n_experts": args.num_experts}
+
     model = TransformerModel(
         vocab_size=args.vocab_size,
         d_model=args.d_model,
-        num_heads=args.num_heads,
+        n_heads=args.num_heads,
         d_ff=args.d_ff,
-        num_layers=args.num_layers,
-        max_seq_length=args.seq_length,
+        n_layers=args.num_layers,
+        max_seq_len=args.seq_length,
+        mlp_class=mlp_class,
+        mlp_kwargs=mlp_kwargs,
     )
     return model
 
 
 def create_data_loaders(args, rank, world_size):
     """Create training and validation data loaders."""
-    # Use dummy data for now (same across all ranks)
-    train_dataset = DummyDataLoader(
-        num_batches=args.num_batches,
+    loader_info = create_distributed_dummy_loaders(
         batch_size=args.batch_size,
         seq_length=args.seq_length,
         vocab_size=args.vocab_size,
+        num_train_batches=args.num_batches,
+        num_val_batches=max(10, args.num_batches // 10),
+        rank=rank,
+        world_size=world_size,
+        seed=args.seed,
+        pin_memory=torch.cuda.is_available(),
     )
-    
-    val_dataset = DummyDataLoader(
-        num_batches=max(10, args.num_batches // 10),
-        batch_size=args.batch_size,
-        seq_length=args.seq_length,
-        vocab_size=args.vocab_size,
-    )
-    
-    return train_dataset, val_dataset
+    return loader_info
+
+
+def resolve_backend(args, device: torch.device) -> str:
+    if args.backend != "auto":
+        return args.backend
+    return "nccl" if device.type == "cuda" else "gloo"
 
 
 def main():
     """Main training loop."""
     args = parse_args()
-    
-    # Resolve distributed environment
+
+    # Resolve env first; initialize process group before model/device selection in multi-rank runs.
     env = dist_utils.resolve_dist_env()
-    rank = env.rank
-    world_size = env.world_size
+    if env.world_size > 1 and not dist_utils.is_dist_initialized():
+        backend = args.backend if args.backend != "auto" else ("nccl" if torch.cuda.is_available() else "gloo")
+        env = dist_utils.resolve_dist_env(default_backend=backend)
+        dist_utils.init_distributed(env)
+
+    rank = dist_utils.get_rank()
+    world_size = dist_utils.get_world_size()
     is_master = rank == 0
-    
-    if is_master:
-        print(f"Starting distributed training: rank={rank}, world_size={world_size}")
-        print(f"Batch size: {args.batch_size}, Epochs: {args.num_epochs}")
-        print(f"Model: d_model={args.d_model}, num_layers={args.num_layers}")
-    
-    # Create model
-    model = create_model(args)
-    
-    # Get device
+
     device = dist_utils.get_device() if world_size > 1 else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
-    model = model.to(device)
-    
+
+    torch.manual_seed(args.seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + rank)
+
     if is_master:
-        print(f"Model on device: {device}")
+        print(f"Starting distributed training: rank={rank}, world_size={world_size}")
+        print(f"Mode: {'DDP-only parity (HGSEL local dispatch)' if args.use_hgsel else 'DDP-only parity (dense baseline)'}")
+        print(f"Batch size (per-rank): {args.batch_size}, Epochs: {args.num_epochs}")
+        print(f"Model: d_model={args.d_model}, num_layers={args.num_layers}, use_hgsel={args.use_hgsel}")
+        print(f"Device: {device}, Backend: {dist_utils.get_backend() or resolve_backend(args, device)}")
+
+    # Create model after device/backend are resolved
+    model = create_model(args).to(device)
+
+    if is_master:
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Create optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # Create training config
     config = TrainingConfig(
@@ -150,29 +167,41 @@ def main():
         log_interval=args.log_interval,
         val_interval=args.val_interval,
         checkpoint_dir=args.checkpoint_dir,
+        use_wandb=False,
     )
-    
-    # Create distributed trainer
+
+    # Create optimizer after model is on correct device.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    # Create distributed trainer (auto_init_from_env handles torchrun envs)
     trainer = DistributedTrainer(
         model=model,
-        optimizer=optimizer,
         config=config,
+        optimizer=optimizer,
         device=device,
+        auto_init_from_env=False,  # Already handled above.
     )
-    
-    # Setup distributed if needed
+
+    # Ensure wrapper is active in non-torchrun manual setups as well.
     if world_size > 1:
         trainer.setup_distributed(
             rank=rank,
             world_size=world_size,
-            backend=args.backend,
+            backend=resolve_backend(args, device),
             master_addr=args.master_addr,
             master_port=args.master_port,
         )
-    
+
     # Create data loaders
-    train_loader, val_loader = create_data_loaders(args, rank, world_size)
-    
+    loader_info = create_data_loaders(args, rank, world_size)
+    train_loader, val_loader = loader_info.train_loader, loader_info.val_loader
+
+    if is_master:
+        print(
+            f"Global batch size check: {loader_info.global_batch_size} = "
+            f"{loader_info.per_rank_batch_size} x {loader_info.world_size}"
+        )
+
     # Train
     if is_master:
         print("\nStarting training...")
@@ -189,6 +218,28 @@ def main():
         if results["val_loss"]:
             print(f"Final val loss: {results['val_loss'][-1]:.4f}")
             print(f"Final val perplexity: {results['val_perplexity'][-1]:.2f}")
+
+        if args.results_json:
+            out_path = Path(args.results_json)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "metadata": {
+                    "script": "experiments/train_distributed_300m.py",
+                    "rank": rank,
+                    "world_size": world_size,
+                    "device": str(device),
+                    "backend": dist_utils.get_backend(),
+                    "use_hgsel": bool(args.use_hgsel),
+                    "global_batch_size": int(loader_info.global_batch_size),
+                    "per_rank_batch_size": int(loader_info.per_rank_batch_size),
+                    "seed": int(args.seed),
+                },
+                "config": vars(args),
+                "results": results,
+            }
+            with out_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            print(f"Wrote results JSON: {out_path}")
         print("="*60)
     
     # Cleanup

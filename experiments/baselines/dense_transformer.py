@@ -9,9 +9,10 @@ Provides:
 - TransformerModel: Small Transformer model for testing
 """
 
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
 
 
 class DenseMLPBlock(nn.Module):
@@ -130,6 +131,7 @@ class TransformerBlock(nn.Module):
         d_ff: int = 2048,
         n_heads: int = 8,
         mlp_class=None,
+        mlp_kwargs: Optional[Dict[str, Any]] = None,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -140,18 +142,22 @@ class TransformerBlock(nn.Module):
         self.attn = AttentionBlock(d_model, n_heads, dropout)
 
         # Instantiate MLP based on class signature
+        mlp_kwargs = dict(mlp_kwargs or {})
+
         if mlp_class.__name__ == "HGSELLayer":
             # HGSELLayer uses different argument names
+            mlp_kwargs.setdefault("d_model", d_model)
+            mlp_kwargs.setdefault("d_ff", d_ff)
             self.mlp = mlp_class(
-                d_model=d_model,
-                d_ff=d_ff,
+                **mlp_kwargs,
             )
         else:
             # DenseMLPBlock and other standard MLPs
+            mlp_kwargs.setdefault("d_model", d_model)
+            mlp_kwargs.setdefault("d_ff", d_ff)
+            mlp_kwargs.setdefault("dropout", dropout)
             self.mlp = mlp_class(
-                d_model=d_model,
-                d_ff=d_ff,
-                dropout=dropout,
+                **mlp_kwargs,
             )
 
         self.ln1 = nn.LayerNorm(d_model)
@@ -201,6 +207,7 @@ class TransformerModel(nn.Module):
         n_heads: int = 8,
         max_seq_len: int = 512,
         mlp_class=None,
+        mlp_kwargs: Optional[Dict[str, Any]] = None,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -216,18 +223,23 @@ class TransformerModel(nn.Module):
         if mlp_class is None:
             mlp_class = DenseMLPBlock
 
-        self.layers = nn.ModuleList(
-            [
+        blocks = []
+        for layer_idx in range(n_layers):
+            layer_mlp_kwargs = dict(mlp_kwargs or {})
+            if mlp_class.__name__ == "HGSELLayer":
+                layer_mlp_kwargs.setdefault("layer_id", layer_idx)
+            blocks.append(
                 TransformerBlock(
                     d_model=d_model,
                     d_ff=d_ff,
                     n_heads=n_heads,
                     mlp_class=mlp_class,
+                    mlp_kwargs=layer_mlp_kwargs,
                     dropout=dropout,
                 )
-                for _ in range(n_layers)
-            ]
-        )
+            )
+
+        self.layers = nn.ModuleList(blocks)
 
         # Output projection
         self.output_proj = nn.Linear(d_model, vocab_size)
@@ -265,6 +277,44 @@ class TransformerModel(nn.Module):
     def count_parameters(self) -> int:
         """Count total trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def get_routing_diagnostics(self) -> Dict[str, Any]:
+        """Aggregate HGSEL routing diagnostics across layers if present."""
+        entropies: List[float] = []
+        expert_loads: List[torch.Tensor] = []
+
+        for layer in self.layers:
+            mlp = getattr(layer, "mlp", None)
+            if mlp is None:
+                continue
+            if hasattr(mlp, "get_expert_load_stats"):
+                stats = mlp.get_expert_load_stats()
+                if "entropy" in stats:
+                    entropies.append(float(stats["entropy"]))
+            if hasattr(mlp, "expert_load_ema"):
+                expert_loads.append(mlp.expert_load_ema.detach())
+
+        if not entropies and not expert_loads:
+            return {}
+
+        diagnostics: Dict[str, Any] = {}
+        if entropies:
+            diagnostics["entropy"] = sum(entropies) / len(entropies)
+        if expert_loads:
+            diagnostics["expert_load"] = torch.stack(expert_loads, dim=0).mean(dim=0)
+        return diagnostics
+
+    def get_phase4_routing_traces(self) -> List[Dict[str, Any]]:
+        """Return recent HGSEL layer traces (one entry per layer)."""
+        traces: List[Dict[str, Any]] = []
+        for layer in self.layers:
+            mlp = getattr(layer, "mlp", None)
+            if mlp is None or not hasattr(mlp, "get_last_forward_trace"):
+                continue
+            trace = mlp.get_last_forward_trace()
+            if trace:
+                traces.append(trace)
+        return traces
 
 
 if __name__ == "__main__":

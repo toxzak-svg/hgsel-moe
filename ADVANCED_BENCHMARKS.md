@@ -10,6 +10,29 @@ Three new benchmarking experiments for HGSEL that test production-readiness hypo
 | **Tail-Latency Decomp** | One component dominates, tail is predictable | All components equal, tail is random | Architecture optimization, SLO planning |
 | **Expert Interference** | Interference < 5%, multi-tenancy safe | Interference catastrophic, need isolation | Multi-user deployment, QoS design |
 
+These are **advanced / Phase 5-style diagnostics**. They are useful before Phase 4 is formally closed, but they do **not** replace the Phase 4 distributed gate workflow (GPU baseline + DDP parity + token-exchange microbenchmark + consolidated gate report).
+
+---
+
+## Phase 4 Gate Reminder (Before Multi-GPU Scaling Claims)
+
+Before using these advanced benchmarks as evidence for multi-GPU readiness, run the Phase 4 gate suite on a Linux/NCCL multi-GPU host and aggregate the outputs:
+
+```bash
+cd hgsel-moe
+python experiments/phase4_gate_report.py \
+    --baseline-json results/gpu_baseline/train_gpu_baseline.json \
+    --parity-json results/phase4/ddp_parity.json \
+    --microbench-json results/token_exchange_micro/benchmark_token_exchange_micro.json \
+    --strict-phase4 \
+    --output results/phase4/phase4_gate_report.json
+```
+
+Interpretation:
+- `GO`: Phase 4 evidence is representative (strict requirements satisfied) and microbenchmark thresholds passed.
+- `WARN`: Data is usable for iteration, but at least one run is non-representative or optimization is needed.
+- `STOP`: Do not make scaling claims yet; fix execution setup (e.g., CUDA/NCCL/multi-rank) or redesign/optimize based on the failing gate.
+
 ---
 
 ## 1. Trace-Driven Expert Working-Set Modeling
@@ -41,6 +64,12 @@ cd hgsel-moe
 python experiments/trace_driven_workset.py
 ```
 
+Quick smoke (CPU-friendly):
+```bash
+cd hgsel-moe
+python experiments/trace_driven_workset.py --smoke --device cpu
+```
+
 ### Interpreting Results
 
 **Coefficient of Variation (CV):**
@@ -58,7 +87,15 @@ python experiments/trace_driven_workset.py
 
 ### What It Tests
 
-Profiles the forward pass and measures latency (per-token, microseconds) for:
+Profiles the HGSEL forward pass and reports per-token latency (microseconds) for:
+- **`forward_pass`:** End-to-end latency (authoritative metric)
+- **`routing_trace`:** HGSEL routing trace time (sum across layers)
+- **`expert_compute_trace`:** HGSEL expert compute trace time (sum across layers)
+- **`combine_trace`:** HGSEL combine trace time (sum across layers)
+- **`dispatch_planning_trace`:** Optional dispatch-planning trace time (usually 0 unless enabled)
+- **`residual_non_hgsel`:** Everything not covered by HGSEL traces (embeddings/attention/layernorm/output/sync gap)
+
+For each component, it reports:
 - **p50 (median):** Typical-case latency
 - **p99 (tail):** 1% of requests are slower
 - **p999 (extreme):** 0.1% of requests are even slower
@@ -83,6 +120,15 @@ If tail is unpredictable (high coefficient of variation):
 ```bash
 cd hgsel-moe
 python experiments/tail_latency_decomposition.py
+```
+
+Note:
+- On CUDA, `forward_pass` is the hard latency metric. Trace-based component rows are useful directional diagnostics but are approximate (they come from per-layer software traces).
+
+Quick smoke (CPU-friendly):
+```bash
+cd hgsel-moe
+python experiments/tail_latency_decomposition.py --smoke --device cpu
 ```
 
 ### Interpreting Results
@@ -131,6 +177,12 @@ cd hgsel-moe
 python experiments/expert_interference_benchmark.py
 ```
 
+Quick smoke (CPU-friendly):
+```bash
+cd hgsel-moe
+python experiments/expert_interference_benchmark.py --smoke --device cpu
+```
+
 ### Interpreting Results
 
 **Three scenarios are measured:**
@@ -166,12 +218,20 @@ Create a test suite that runs all three:
 cd hgsel-moe
 
 echo "Running advanced benchmarks..."
-python experiments/trace_driven_workset.py > ../results/workset.log 2>&1
-python experiments/tail_latency_decomposition.py > ../results/tail_latency.log 2>&1
-python experiments/expert_interference_benchmark.py > ../results/interference.log 2>&1
+python experiments/trace_driven_workset.py > results/workset.log 2>&1
+python experiments/tail_latency_decomposition.py > results/tail_latency.log 2>&1
+python experiments/expert_interference_benchmark.py > results/interference.log 2>&1
 
 echo "All benchmarks complete. Results in results/ directory."
-ls -la ../results/
+ls -la results/
+```
+
+Smoke suite (fast local validation):
+```bash
+cd hgsel-moe
+python experiments/trace_driven_workset.py --smoke --device cpu --no-plot --json-output results/workset_smoke.json > results/workset_smoke.log 2>&1
+python experiments/tail_latency_decomposition.py --smoke --device cpu --no-plot --json-output results/tail_latency_smoke.json > results/tail_latency_smoke.log 2>&1
+python experiments/expert_interference_benchmark.py --smoke --device cpu --no-plot --json-output results/interference_smoke.json > results/interference_smoke.log 2>&1
 ```
 
 ---
@@ -182,6 +242,10 @@ All benchmarks generate:
 - **Console output:** Immediate pass/fail summaries
 - **PNG plots:** `results/workset_curve.png`, `results/tail_latency_decomp.png`, `results/expert_interference.png`
 - **Log files:** Detailed measurements for post-processing
+- **Optional JSON summaries:** Use `--json-output <path>` for machine-readable results (recommended for CI/automation)
+
+Tip:
+- Use `--no-plot` for smoke/CI runs to skip matplotlib rendering and speed up feedback.
 
 ---
 
@@ -230,10 +294,11 @@ If any test fails, debug training (salt tuning, auxiliary loss weight, expert co
 
 After running these benchmarks:
 
-1. **Predictable working sets?** → Design routing compiler (Phase 4+)
-2. **Long tail latency?** → Profile individual components, pipeline operations
-3. **High interference?** → Add expert affinity metadata, implement QoS scheduling
-4. **All pass?** → Ready for multi-GPU and production deployment
+1. **Phase 4 gates green (`phase4_gate_report.py --strict-phase4`)?** If not, fix distributed setup/communication budget issues first.
+2. **Predictable working sets?** → Design routing compiler (Phase 4+/5)
+3. **Long tail latency?** → Profile individual components, pipeline operations
+4. **High interference?** → Add expert affinity metadata, implement QoS scheduling
+5. **All pass?** → Ready for stronger multi-GPU + production-readiness claims
 
 ---
 

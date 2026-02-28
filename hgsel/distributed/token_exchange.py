@@ -6,7 +6,8 @@ Provides all-to-all token exchange for routing tokens to remote experts.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+import time
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -17,6 +18,7 @@ from hgsel.distributed.dist_utils import (
     is_dist_initialized,
 )
 from hgsel.distributed.dispatch_api import RemoteDispatchRequests
+from hgsel.distributed.phase4_trace import per_rank_shape_signature
 
 
 class TokenExchange:
@@ -29,6 +31,7 @@ class TokenExchange:
             group: torch.distributed process group (default: None = default group)
         """
         self.group = group
+        self.last_exchange_stats: Optional[Dict[str, Any]] = None
 
     def _empty_payload(self, payloads: Dict[int, torch.Tensor]) -> torch.Tensor:
         """Create an empty tensor matching the shape of payloads."""
@@ -36,6 +39,40 @@ class TokenExchange:
             sample = next(iter(payloads.values()))
             return torch.empty((0,) + sample.shape[1:], device=sample.device, dtype=sample.dtype)
         return torch.empty(0)
+
+    def _capture_stats(
+        self,
+        payloads: Dict[int, torch.Tensor],
+        all_to_all_latency_ms: float,
+        world_size: int,
+        max_tokens: int,
+        distributed_enabled: bool,
+    ) -> None:
+        per_rank_send_counts = {
+            int(dst_rank): int(payloads.get(dst_rank, self._empty_payload(payloads)).shape[0])
+            for dst_rank in range(world_size)
+        }
+        per_rank_send_bytes = {}
+        for dst_rank in range(world_size):
+            tensor = payloads.get(dst_rank)
+            if tensor is None:
+                per_rank_send_bytes[dst_rank] = 0
+            else:
+                per_rank_send_bytes[dst_rank] = int(tensor.numel() * tensor.element_size())
+
+        self.last_exchange_stats = {
+            "all_to_all_latency_ms": float(all_to_all_latency_ms),
+            "distributed_enabled": bool(distributed_enabled),
+            "world_size": int(world_size),
+            "max_tokens_per_rank_padded": int(max_tokens),
+            "per_rank_send_counts": per_rank_send_counts,
+            "per_rank_send_bytes": per_rank_send_bytes,
+            "shape_signature": per_rank_shape_signature(
+                per_rank_send_counts,
+                world_size=world_size,
+                prefix="exchange_send",
+            ),
+        }
 
     def exchange(self, payloads: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
         """Exchange token payloads across all ranks using all-to-all.
@@ -54,9 +91,23 @@ class TokenExchange:
         
         # Fallback for single-GPU or non-distributed
         if world_size == 1:
+            self._capture_stats(
+                payloads=payloads,
+                all_to_all_latency_ms=0.0,
+                world_size=1,
+                max_tokens=int(payloads.get(0, self._empty_payload(payloads)).shape[0]),
+                distributed_enabled=False,
+            )
             return {0: payloads.get(0, self._empty_payload(payloads))}
-        
+
         if not is_dist_initialized():
+            self._capture_stats(
+                payloads=payloads,
+                all_to_all_latency_ms=0.0,
+                world_size=world_size,
+                max_tokens=max((int(p.shape[0]) for p in payloads.values()), default=0),
+                distributed_enabled=False,
+            )
             return {0: payloads.get(0, self._empty_payload(payloads))}
         
         # Get sample tensor for device, dtype, and batch shape
@@ -79,9 +130,13 @@ class TokenExchange:
                 tokens = payloads[dst_rank]
                 # Pad if necessary
                 if tokens.shape[0] < max_tokens:
-                    padding = (0, 0) * len(token_shape) + (0, max_tokens - tokens.shape[0])
-                    padding = padding[::-1]  # Reverse for torch.nn.functional.pad
-                    tokens = torch.nn.functional.pad(tokens, padding, mode='constant', value=0)
+                    pad_rows = max_tokens - tokens.shape[0]
+                    pad_tensor = torch.zeros(
+                        (pad_rows,) + token_shape,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    tokens = torch.cat([tokens, pad_tensor], dim=0)
                 send_list.append(tokens)
             else:
                 # Create empty padded tensor
@@ -94,7 +149,20 @@ class TokenExchange:
         recv_buffer = torch.zeros_like(send_buffer)
         
         # All-to-all exchange
+        if torch.cuda.is_available() and send_buffer.is_cuda:
+            torch.cuda.synchronize(device=send_buffer.device)
+        t_all_to_all_start = time.perf_counter()
         all_to_all(send_buffer, recv_buffer, group=self.group)
+        if torch.cuda.is_available() and recv_buffer.is_cuda:
+            torch.cuda.synchronize(device=recv_buffer.device)
+        all_to_all_latency_ms = (time.perf_counter() - t_all_to_all_start) * 1000.0
+        self._capture_stats(
+            payloads=payloads,
+            all_to_all_latency_ms=all_to_all_latency_ms,
+            world_size=world_size,
+            max_tokens=int(max_tokens),
+            distributed_enabled=True,
+        )
         
         # Unpack received buffers
         received = {}

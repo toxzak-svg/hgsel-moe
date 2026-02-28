@@ -19,6 +19,8 @@ Phase 5 completed the full benchmarking and profiling infrastructure for HGSEL d
 
 All Phase 5 deliverables are complete and tested. The infrastructure is ready for full benchmarking sweeps and performance optimization iterations.
 
+> Sequencing note: This document records completion of profiling/benchmarking infrastructure. It does **not** by itself prove Phase 4 multi-GPU scaling. Phase 4 still requires the systems validation gates defined in `PHASE4_PLANNING.md` (instrumented GPU baseline, DDP parity, and expert-parallel communication microbenchmarking before scale claims).
+
 ---
 
 ## Completed Deliverables
@@ -238,6 +240,7 @@ python experiments/generate_performance_report.py \
 - **TokenExchange:** Latency profiler tracks all-to-all component
 - **Expert Sharding:** Memory profiler estimates per-rank memory
 - **dist_utils:** All modules use rank/world_size from dist_utils
+- **Phase 4 Gatekeeping:** `experiments/benchmark_token_exchange_micro.py` should be run before interpreting Phase 5 profiler outputs as evidence of scalable expert parallelism
 
 ### Data Flow
 ```
@@ -361,8 +364,15 @@ All success criteria met. ✓
 
 ---
 
-## Next Steps (Phase 6)
+## Next Steps (Phase 4/6 Sequencing)
 
+Before moving to Phase 6 architecture changes, use the Phase 5 profiling tools to finish Phase 4 proof-of-scale:
+
+1. Run the communication microbenchmark (`benchmark_token_exchange_micro.py`) and quantify all-to-all share vs local expert compute
+2. Validate DDP-only parity and distributed checkpoint roundtrip correctness
+3. Produce a 1/2/4 GPU scaling plot with communication breakdown
+
+Once Phase 4 scale proof is established, proceed to Phase 6 optimizations:
 Phase 6 will use Phase 5 results to optimize:
 
 1. **Communication Optimization**

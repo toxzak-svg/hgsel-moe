@@ -19,9 +19,11 @@ Auxiliary outputs:
   - routing_info: Dict with diagnostics
 """
 
+import time
+from typing import Any, Dict, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple, Optional
 
 from hgsel.routing import MultiHashRouter
 from hgsel.expert import ExpertBank
@@ -113,6 +115,7 @@ class HGSELLayer(nn.Module):
         self.total_tokens_routed = 0
         self.routing_entropy = 0.0
         self.dispatch_pipeline = None
+        self.last_forward_trace: Optional[Dict[str, Any]] = None
 
         if self.enable_dispatch_planning and self.dispatch_shard_map is not None:
             self.dispatch_pipeline = DispatchPipeline(
@@ -156,10 +159,13 @@ class HGSELLayer(nn.Module):
         device = hidden_states_flat.device
 
         # Route tokens to experts
+        t_router_start = time.perf_counter()
         selected_experts, expert_weights, expert_masks = self.router(hidden_states_flat)
+        router_ms = (time.perf_counter() - t_router_start) * 1000.0
 
         # Optionally build a dispatch plan (no communication yet).
         dispatch_summary = None
+        dispatch_trace: Optional[Dict[str, Any]] = None
         if self.dispatch_pipeline is not None:
             dispatch_result = self.dispatch_pipeline.build(
                 hidden_states=hidden_states_flat,
@@ -169,16 +175,21 @@ class HGSELLayer(nn.Module):
                 "local_tokens": len(dispatch_result.local_batch.token_indices),
                 "remote_ranks": sorted(dispatch_result.remote_requests.rank_to_token_indices.keys()),
             }
+            dispatch_trace = dict(self.dispatch_pipeline.last_build_stats or {})
 
         # Execute sparse experts (returns [batch * seq_len, k_active, d_model])
+        t_expert_start = time.perf_counter()
         expert_outputs, expert_loads = self.expert_bank(
             hidden_states_flat,
             selected_experts,
             expert_masks,
         )
+        expert_compute_ms = (time.perf_counter() - t_expert_start) * 1000.0
 
         # Combine expert outputs
+        t_combine_start = time.perf_counter()
         output = self.combine(expert_outputs)
+        combine_ms = (time.perf_counter() - t_combine_start) * 1000.0
 
         # Reshape back if needed
         if should_reshape:
@@ -201,6 +212,19 @@ class HGSELLayer(nn.Module):
 
         # Statistics
         self.total_tokens_routed += batch_seq_len
+        self.last_forward_trace = {
+            "layer_id": int(self.layer_id),
+            "batch_tokens": int(batch_seq_len),
+            "router_ms": float(router_ms),
+            "expert_compute_ms": float(expert_compute_ms),
+            "combine_ms": float(combine_ms),
+            "salt": float(self.router.salt),
+            "k_active": int(self.k_active),
+            "n_experts": int(self.n_experts),
+            "expert_loads": expert_loads.detach().cpu(),
+            "routing_entropy": float(self.routing_entropy),
+            "dispatch": dispatch_trace,
+        }
 
         # Optionally return routing diagnostics
         if return_routing_info:
@@ -215,6 +239,10 @@ class HGSELLayer(nn.Module):
             return output, routing_info
 
         return output
+
+    def get_last_forward_trace(self) -> Optional[Dict[str, Any]]:
+        """Get lightweight timing/routing trace for the most recent forward pass."""
+        return self.last_forward_trace
 
     def set_salt(self, salt: float):
         """Tune load-balancing salt parameter."""
