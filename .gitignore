@@ -63,7 +63,11 @@ dmypy.json
 
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# Ignore all notebooks by default, but allow specific ones
 *.ipynb
+!notebooks/*.ipynb
+
 
 # Weights & Biases
 wandb/
