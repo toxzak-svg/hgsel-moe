@@ -39,7 +39,11 @@ distributed = [
 ]
 
 [tool.setuptools]
-packages = ["hgsel"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hgsel*"]
 
 [tool.setuptools.package-data]
 hgsel = ["py.typed"]

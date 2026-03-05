@@ -159,6 +159,49 @@ python experiments/benchmark_300m.py
 python experiments/validate_phase3.py
 ```
 
+## Vast.ai Easy Deployment
+
+The repository includes a single entrypoint script for Vast instances:
+
+```bash
+bash scripts/vast_easy_run.sh
+```
+
+What it does by default:
+- Creates/uses a local virtualenv (`.venv` by default)
+- Installs dependencies (`requirements.txt` and editable `hgsel`)
+- Runs a smoke validation (`experiments/validate_phase3.py`)
+- Uses offline W&B mode unless overridden
+
+Useful environment variables:
+- `HGSEL_TASK`: `smoke` (default), `validate`, `benchmark`, `train`, `shell`
+- `HGSEL_SKIP_INSTALL=true`: skip pip install (for pre-baked images)
+- `HGSEL_VENV_DIR=/path/to/venv`: override virtualenv path
+- `HGSEL_REQUIRE_GPU=true`: fail fast if CUDA is unavailable
+- `HGSEL_DEVICE=cuda|cpu`: device used by `train` task
+- `HGSEL_TRAIN_ARGS="--batch-size 8 --num-epochs 1"`: extra args for `train`
+- `HGSEL_KEEP_ALIVE=true`: keep container alive after task completion
+
+Examples:
+
+```bash
+# Run smoke test on a fresh Vast instance
+bash scripts/vast_easy_run.sh
+
+# Benchmark run
+HGSEL_TASK=benchmark bash scripts/vast_easy_run.sh
+
+# Short training run
+HGSEL_TASK=train HGSEL_TRAIN_ARGS="--batch-size 8 --num-epochs 1" bash scripts/vast_easy_run.sh
+```
+
+Container option:
+
+```bash
+docker build -f Dockerfile.vast -t hgsel-vast:latest .
+docker run --gpus all --rm -e HGSEL_TASK=smoke hgsel-vast:latest
+```
+
 ## Advanced Benchmarks (Phase 3+)
 
 ### 1. Trace-Driven Expert Working-Set Modeling
