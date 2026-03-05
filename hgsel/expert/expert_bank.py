@@ -125,25 +125,45 @@ class ExpertBank(nn.Module):
         # Track expert utilization
         expert_loads = torch.zeros(self.n_experts, dtype=torch.float32, device=device)
 
-        # Execute selected experts
-        for seq_idx in range(batch_seq_len):
-            token_input = hidden_states[seq_idx : seq_idx + 1]  # [1, d_model]
-
+        # Flatten selected_experts to get all (token, k_idx, expert_id) routing decisions
+        # selected_experts: [batch * seq_len, k_active]
+        # We need to process each expert once with all tokens routed to it
+        
+        # Build dispatch lists for each expert
+        for expert_id in range(self.n_experts):
+            # Find all (token_idx, k_idx) pairs that route to this expert
+            token_indices = []
+            k_indices = []
+            
             for k_idx in range(self.k_active):
-                expert_id = int(selected_experts[seq_idx, k_idx])
-                expert = self.experts[expert_id]
-
-                # Execute expert
-                expert_output = expert(token_input)  # [1, d_model]
-
-                # Store in k-th position
-                expert_outputs[seq_idx, k_idx] = expert_output[0]
-
-                # Track load
-                expert_loads[expert_id] += 1.0
-
-        # Normalize loads to per-token activation rate
-        expert_loads = expert_loads / max(batch_seq_len, 1)
+                # Get mask for tokens where k_idx-th expert is expert_id
+                mask = (selected_experts[:, k_idx] == expert_id)
+                token_idx = torch.nonzero(mask, as_tuple=True)[0]
+                
+                if len(token_idx) > 0:
+                    token_indices.append(token_idx)
+                    k_indices.extend([k_idx] * len(token_idx))
+            
+            # Skip if no tokens route to this expert
+            if len(token_indices) == 0:
+                continue
+            
+            # Concatenate all token indices for this expert
+            token_indices = torch.cat(token_indices)
+            k_indices = torch.tensor(k_indices, dtype=torch.long, device=device)
+            
+            # Track load
+            expert_loads[expert_id] = len(token_indices) / batch_seq_len
+            
+            # Gather inputs for this expert (batch processing)
+            expert_inputs = hidden_states[token_indices]  # [num_routed_tokens, d_model]
+            
+            # Execute expert on all assigned tokens at once
+            expert = self.experts[expert_id]
+            expert_result = expert(expert_inputs)  # [num_routed_tokens, d_model]
+            
+            # Scatter results back to output tensor
+            expert_outputs[token_indices, k_indices] = expert_result
 
         return expert_outputs, expert_loads
 
