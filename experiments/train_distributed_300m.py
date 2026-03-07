@@ -27,7 +27,11 @@ sys.path.insert(0, str(current_dir))
 from hgsel.distributed import dist_utils
 from hgsel.layer import HGSELLayer
 from hgsel.training.distributed_trainer import DistributedTrainer
-from hgsel.training.dist_data import create_distributed_dummy_loaders
+from hgsel.training.dist_data import (
+    create_distributed_dummy_loaders,
+    create_distributed_hf_text_loaders,
+)
+from hgsel.training.losses import LoadBalancingLoss
 from hgsel.training.trainer import TrainingConfig
 from experiments.baselines.dense_transformer import TransformerModel
 
@@ -52,9 +56,57 @@ def parse_args():
     parser.add_argument("--num-heads", type=int, default=4, help="Number of attention heads")
     
     # Data
+    parser.add_argument(
+        "--data-source",
+        type=str,
+        default="dummy",
+        choices=["dummy", "hf_text"],
+        help="Data source: synthetic dummy data (default) or Hugging Face text dataset",
+    )
     parser.add_argument("--seq-length", type=int, default=128, help="Sequence length")
     parser.add_argument("--vocab-size", type=int, default=256, help="Vocabulary size")
     parser.add_argument("--num-batches", type=int, default=100, help="Number of batches (dummy data)")
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default="wikitext",
+        help="HF dataset name when --data-source=hf_text",
+    )
+    parser.add_argument(
+        "--dataset-config",
+        type=str,
+        default="wikitext-2-raw-v1",
+        help="HF dataset config name when --data-source=hf_text",
+    )
+    parser.add_argument("--train-split", type=str, default="train", help="HF train split")
+    parser.add_argument("--val-split", type=str, default="validation", help="HF validation split")
+    parser.add_argument("--text-column", type=str, default="text", help="HF text column")
+    parser.add_argument(
+        "--tokenizer-mode",
+        type=str,
+        default="byte",
+        choices=["byte", "char"],
+        help="Text-to-token conversion for hf_text source",
+    )
+    parser.add_argument(
+        "--dataset-stride",
+        type=int,
+        default=0,
+        help="Token window stride for hf_text (0 means seq_length)",
+    )
+    parser.add_argument(
+        "--max-train-chars",
+        type=int,
+        default=0,
+        help="Optional cap for train text characters when using hf_text (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--max-val-chars",
+        type=int,
+        default=0,
+        help="Optional cap for validation text characters when using hf_text (0 = unlimited)",
+    )
+    parser.add_argument("--dataset-cache-dir", type=str, default="", help="Optional HF cache directory")
     
     # Loss configuration
     parser.add_argument("--auxiliary-loss-weight", type=float, default=0.001, help="Auxiliary loss weight")
@@ -99,18 +151,39 @@ def create_model(args):
 
 def create_data_loaders(args, rank, world_size):
     """Create training and validation data loaders."""
-    loader_info = create_distributed_dummy_loaders(
+    if args.data_source == "dummy":
+        return create_distributed_dummy_loaders(
+            batch_size=args.batch_size,
+            seq_length=args.seq_length,
+            vocab_size=args.vocab_size,
+            num_train_batches=args.num_batches,
+            num_val_batches=max(10, args.num_batches // 10),
+            rank=rank,
+            world_size=world_size,
+            seed=args.seed,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+    stride = args.dataset_stride if args.dataset_stride > 0 else None
+    return create_distributed_hf_text_loaders(
         batch_size=args.batch_size,
         seq_length=args.seq_length,
         vocab_size=args.vocab_size,
-        num_train_batches=args.num_batches,
-        num_val_batches=max(10, args.num_batches // 10),
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        train_split=args.train_split,
+        val_split=args.val_split,
+        text_column=args.text_column,
         rank=rank,
         world_size=world_size,
         seed=args.seed,
+        tokenizer_mode=args.tokenizer_mode,
+        stride=stride,
+        max_train_chars=args.max_train_chars,
+        max_val_chars=args.max_val_chars,
+        cache_dir=args.dataset_cache_dir,
         pin_memory=torch.cuda.is_available(),
     )
-    return loader_info
 
 
 def resolve_backend(args, device: torch.device) -> str:
@@ -148,6 +221,7 @@ def main():
         print(f"Batch size (per-rank): {args.batch_size}, Epochs: {args.num_epochs}")
         print(f"Model: d_model={args.d_model}, num_layers={args.num_layers}, use_hgsel={args.use_hgsel}")
         print(f"Device: {device}, Backend: {dist_utils.get_backend() or resolve_backend(args, device)}")
+        print(f"Data source: {args.data_source}")
 
     # Create model after device/backend are resolved
     model = create_model(args).to(device)
@@ -162,7 +236,7 @@ def main():
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
         max_steps=args.max_steps,
-        auxiliary_loss_weight=args.auxiliary_loss_weight,
+        aux_loss_weight=args.auxiliary_loss_weight,
         clip_grad_norm=args.clip_grad_norm,
         log_interval=args.log_interval,
         val_interval=args.val_interval,
@@ -172,6 +246,11 @@ def main():
 
     # Create optimizer after model is on correct device.
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    aux_loss_fn = None
+    if args.use_hgsel and args.auxiliary_loss_weight > 0:
+        aux_loss_fn = LoadBalancingLoss(n_experts=args.num_experts, initial_weight=1.0)
+        if is_master:
+            print(f"Auxiliary load balancing enabled (weight={args.auxiliary_loss_weight})")
 
     # Create distributed trainer (auto_init_from_env handles torchrun envs)
     trainer = DistributedTrainer(
@@ -179,6 +258,7 @@ def main():
         config=config,
         optimizer=optimizer,
         device=device,
+        aux_loss_fn=aux_loss_fn,
         auto_init_from_env=False,  # Already handled above.
     )
 

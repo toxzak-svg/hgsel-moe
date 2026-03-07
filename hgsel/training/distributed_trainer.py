@@ -200,13 +200,46 @@ class DistributedTrainer(Trainer):
             labels.reshape(-1),
         )
 
+    def _compute_auxiliary_loss(self) -> tuple[torch.Tensor, int]:
+        """Compute HGSEL auxiliary load-balancing loss across layers.
+
+        Returns:
+            (aux_loss, num_layers_used)
+        """
+        zero = torch.tensor(0.0, device=self.device)
+        if self.aux_loss_fn is None:
+            return zero, 0
+
+        aux_weight = float(self.get_aux_loss_weight())
+        if aux_weight <= 0.0:
+            return zero, 0
+
+        layer_losses = []
+        base_model = self._unwrap_model()
+        for module in base_model.modules():
+            expert_load_ema = getattr(module, "expert_load_ema", None)
+            if not isinstance(expert_load_ema, torch.Tensor):
+                continue
+            layer_loss = self.aux_loss_fn(expert_load_ema)
+            if not torch.is_tensor(layer_loss):
+                layer_loss = torch.tensor(float(layer_loss), device=self.device)
+            layer_losses.append(layer_loss.to(device=self.device, dtype=torch.float32))
+
+        if not layer_losses:
+            return zero, 0
+
+        aux_loss = torch.stack(layer_losses).mean() * aux_weight
+        return aux_loss, len(layer_losses)
+
     def train_step(self, batch: Any) -> Dict[str, float]:
         """Execute one training step (DDP handles gradient sync when wrapped)."""
         self.model.train()
 
         self.optimizer.zero_grad(set_to_none=True)
-        loss = self._compute_loss(batch)
-        loss.backward()
+        main_loss = self._compute_loss(batch)
+        aux_loss, aux_layers = self._compute_auxiliary_loss()
+        total_loss = main_loss + aux_loss
+        total_loss.backward()
 
         if self.config.clip_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(self._unwrap_model().parameters(), self.config.clip_grad_norm)
@@ -218,11 +251,18 @@ class DistributedTrainer(Trainer):
         self.optimizer.step()
 
         # Distributed mean loss for logging/comparison.
-        loss_for_logging = loss.detach().clone()
-        dist_utils.all_reduce_mean(loss_for_logging)
+        main_for_logging = main_loss.detach().clone()
+        aux_for_logging = aux_loss.detach().clone()
+        total_for_logging = total_loss.detach().clone()
+        dist_utils.all_reduce_mean(main_for_logging)
+        dist_utils.all_reduce_mean(aux_for_logging)
+        dist_utils.all_reduce_mean(total_for_logging)
 
         metrics = {
-            "loss": float(loss_for_logging.item()),
+            "loss": float(main_for_logging.item()),
+            "aux_loss": float(aux_for_logging.item()),
+            "total_loss": float(total_for_logging.item()),
+            "aux_loss_layers": int(aux_layers),
             "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
         }
 
@@ -301,7 +341,10 @@ class DistributedTrainer(Trainer):
                     msg = (
                         f"Epoch {epoch + 1}/{self.config.num_epochs} | "
                         f"Batch {batch_idx}/{len(train_loader)} | "
-                        f"Loss: {metrics['loss']:.4f} | Avg: {avg_loss:.4f} | "
+                        f"Loss: {metrics['loss']:.4f} | "
+                        f"Aux: {metrics.get('aux_loss', 0.0):.4f} | "
+                        f"Total: {metrics.get('total_loss', metrics['loss']):.4f} | "
+                        f"Avg: {avg_loss:.4f} | "
                         f"LR: {metrics['learning_rate']:.6f}"
                     )
                     if "entropy" in metrics:

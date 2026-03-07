@@ -11,6 +11,7 @@ sys.path.insert(0, str(current_dir))
 
 from hgsel.training.dist_data import (  # noqa: E402
     create_distributed_dummy_loaders,
+    create_distributed_text_loaders_from_text,
     set_distributed_epoch,
 )
 
@@ -98,3 +99,48 @@ def test_create_distributed_dummy_loaders_seed_reproducibility():
 
     assert torch.equal(dataset_a.input_ids, dataset_b.input_ids)
     assert torch.equal(dataset_a.labels, dataset_b.labels)
+
+
+def test_create_distributed_text_loaders_from_text_byte_tokenization():
+    info = create_distributed_text_loaders_from_text(
+        train_text=("hello world\n" * 200),
+        val_text=("goodbye world\n" * 100),
+        batch_size=4,
+        seq_length=16,
+        vocab_size=256,
+        rank=0,
+        world_size=1,
+        seed=7,
+        tokenizer_mode="byte",
+    )
+
+    assert info.global_batch_size == 4
+    assert info.per_rank_batch_size == 4
+    assert len(info.train_loader) > 0
+    assert len(info.val_loader) > 0
+    batch = next(iter(info.train_loader))
+    input_ids, labels = batch
+    assert input_ids.shape == (4, 16)
+    assert labels.shape == (4, 16)
+    assert torch.all(input_ids >= 0)
+    assert torch.all(input_ids < 256)
+
+
+def test_create_distributed_text_loaders_from_text_distributed_sampler():
+    info = create_distributed_text_loaders_from_text(
+        train_text=("abcdefg " * 200),
+        val_text=("hijklmn " * 100),
+        batch_size=2,
+        seq_length=8,
+        vocab_size=64,
+        rank=0,
+        world_size=2,
+        seed=11,
+        tokenizer_mode="char",
+    )
+
+    assert isinstance(info.train_sampler, DistributedSampler)
+    assert isinstance(info.val_sampler, DistributedSampler)
+    assert info.global_batch_size == 4
+    assert info.per_rank_batch_size == 2
+    assert len(info.train_loader) > 0
